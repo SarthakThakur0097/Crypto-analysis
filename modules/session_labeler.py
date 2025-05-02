@@ -1,36 +1,60 @@
+# modules/session_labeler.py
+
+import os
 import pandas as pd
 from datetime import time
-import os
+from typing import Optional, Tuple
+from modules.session_labeling import label_session  # your overlap-aware helper
 
-def label_session(ts):
-    t = ts.time()
-    if time(0, 0) <= t < time(7, 0):
-        return 'Asia'
-    elif time(7, 0) <= t < time(13, 0):
-        return 'London'
-    elif time(13, 0) <= t < time(20, 0):
-        return 'New York'
-    else:
-        return 'Other'
+def add_session_labels(
+    df: pd.DataFrame,
+    timestamp_col: str         = 'time',
+    tz: Optional[str]         = None
+) -> pd.DataFrame:
+    """
+    Add a 'session' column to df based on UTC time (with overlaps).
+    Expects a 'time' datetime column or datetime index.
+    """
+    df = df.copy()
 
-def label_and_save_sessions(file_path, output_prefix, timestamp_col='timestamp'):
-    # Load and sort
-    df = pd.read_csv(file_path, parse_dates=[timestamp_col])
-    df = df.sort_values(by=timestamp_col)
-    df.set_index(timestamp_col, inplace=True)
+    # 1) parse & set index on `timestamp_col`
+    if timestamp_col in df.columns:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+        df.set_index(timestamp_col, inplace=True)
+    elif not pd.api.types.is_datetime64_any_dtype(df.index):
+        raise KeyError(f"No '{timestamp_col}' column and index is not datetime.")
 
-    # Label session
+    # 2) optional timezone conversion
+    if tz:
+        df.index = df.index.tz_localize('UTC').tz_convert(tz)
+
+    # 3) map timestamps through your overlap-aware helper
     df['session'] = df.index.map(label_session)
+    return df
 
-    # Create folders if not exist
-    os.makedirs('./Resampled/raw', exist_ok=True)
-    os.makedirs('./Resampled/additional_features', exist_ok=True)
+def label_and_save_sessions(
+    file_path:     str,
+    output_prefix: str,
+    timestamp_col: str          = 'time',
+    output_base:   str          = './Resampled'
+) -> Tuple[str, str]:
+    """
+    Read CSV, label sessions (with overlaps), and save:
+      • raw labeled CSV in output_base/raw/
+      • feature-ready CSV in output_base/additional_features/
+    Returns (raw_path, features_path).
+    """
+    df = pd.read_csv(file_path, parse_dates=[timestamp_col])
+    df = add_session_labels(df, timestamp_col=timestamp_col)
 
-    # Save labeled and feature-ready copies
-    raw_path = f'./Resampled/raw/{output_prefix}_labeled.csv'
-    features_path = f'./Resampled/additional_features/{output_prefix}_features.csv'
+    raw_dir  = os.path.join(output_base, 'raw')
+    feat_dir = os.path.join(output_base, 'additional_features')
+    os.makedirs(raw_dir,  exist_ok=True)
+    os.makedirs(feat_dir, exist_ok=True)
 
-    df.to_csv(raw_path)
-    df.to_csv(features_path)
+    raw_path      = os.path.join(raw_dir,  f'{output_prefix}_labeled.csv')
+    features_path = os.path.join(feat_dir, f'{output_prefix}_features.csv')
 
+    df.to_csv(raw_path,      index=True, date_format='%Y-%m-%d %H:%M:%S')
+    df.to_csv(features_path, index=True, date_format='%Y-%m-%d %H:%M:%S')
     return raw_path, features_path
