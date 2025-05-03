@@ -1,64 +1,88 @@
-import mplfinance as mpf
+# modules/analyze_session_stats.py
+
+import os
+import pandas as pd
 import matplotlib.pyplot as plt
-from datetime import time
+from modules.session_labeler import add_session_labels  # reuse your session logic
 
-def plot_candles(df, start_time, end_time, title=None):
+def analyze_session_stats(
+    input_csv: str,
+    title: str,
+    output_folder: str = None
+):
     """
-    Plot candlestick chart for a given datetime range with session open markers.
-    
-    Args:
-        df: (DataFrame) OHLCV data with DateTime index
-        start_time: (str) start datetime, e.g., '2025-04-18 00:00'
-        end_time: (str) end datetime, e.g., '2025-04-20 12:00'
-        title: (str) optional chart title
+    Analyze session-based movement and volatility statistics for a given dataset.
+    Uses the 'time' column as the index. Saves CSV and PNGs if output_folder is provided.
     """
+    # --- Load & index on 'time' ---
+    df = pd.read_csv(
+        input_csv,
+        parse_dates=['time']
+    )
+    df.set_index('time', inplace=True)
+    df.sort_index(inplace=True)
 
-    # Make sure index is datetime
-    df.index = pd.to_datetime(df.index)
+    # --- Core metrics ---
+    df['range']        = df['high'] - df['low']
+    df['price_return'] = df['close'] - df['open']
+    df['abs_return']   = df['price_return'].abs()
 
-    # Slice the desired time range
-    plot_df = df.loc[start_time:end_time]
+    # --- ATR 14 & efficiency ---
+    df['prior_close'] = df['close'].shift(1)
+    df['tr1']         = df['high'] - df['low']
+    df['tr2']         = (df['high'] - df['prior_close']).abs()
+    df['tr3']         = (df['low']  - df['prior_close']).abs()
+    df['true_range']  = df[['tr1','tr2','tr3']].max(axis=1)
+    df['ATR_14']      = df['true_range'].rolling(window=14).mean()
+    df['efficiency']  = df['range'] / df['ATR_14']
 
-    if plot_df.empty:
-        print(f"No candles found between {start_time} and {end_time}.")
-        return
+    # drop rows before ATR warm-up completes
+    df.dropna(subset=['ATR_14'], inplace=True)
 
-    # Rename columns for mplfinance if needed
-    plot_df = plot_df[['Open', 'High', 'Low', 'Close', 'Volume']]
+    # --- Session labeling (reuse existing module) ---
+    df = add_session_labels(df)  # adds df['session']
 
-    # Step 1: Create figure and axes first
-    fig, axes = mpf.plot(plot_df,
-                         type='candle',
-                         style='charles',
-                         volume=True,
-                         title=title if title else f'Candles {start_time} to {end_time}',
-                         datetime_format='%b %d %H:%M',
-                         xrotation=15,
-                         returnfig=True)
+    # --- Aggregate stats per session ---
+    agg = {
+        'range':        ['mean','max'],
+        'ATR_14':       ['mean','max'],
+        'price_return': ['mean','std'],
+        'abs_return':   ['mean','std'],
+        'efficiency':   'mean',
+    }
+    session_stats = df.groupby('session').agg(agg)
 
-    ax = axes[0]  # Main price axis
+    print(f"\n=== Session Stats: {title} ===")
+    print(session_stats)
 
-    # Step 2: Add session open lines
-    asia_open = time(0, 0)
-    london_open = time(8, 0)
-    ny_open = time(13, 0)
+    # sanitize title for filenames
+    safe_title = title.replace(' ', '_')
 
-    # Find timestamps matching session opens
-    asia_lines = plot_df.index[plot_df.index.time == asia_open]
-    london_lines = plot_df.index[plot_df.index.time == london_open]
-    ny_lines = plot_df.index[plot_df.index.time == ny_open]
+    # --- Save CSV if requested ---
+    if output_folder:
+        os.makedirs(output_folder, exist_ok=True)
+        csv_path = os.path.join(output_folder, f"session_stats_{safe_title}.csv")
+        session_stats.to_csv(csv_path)
+        print(f"→ saved stats CSV: {csv_path}")
 
-    for t in asia_lines:
-        ax.axvline(t, color='orange', linestyle='--', linewidth=0.7, label='Asia Open' if t==asia_lines[0] else "")
-    for t in london_lines:
-        ax.axvline(t, color='green', linestyle='--', linewidth=0.7, label='London Open' if t==london_lines[0] else "")
-    for t in ny_lines:
-        ax.axvline(t, color='blue', linestyle='--', linewidth=0.7, label='NY Open' if t==ny_lines[0] else "")
+    # --- Plot helper ---
+    def plot_dist(series: pd.Series, name: str):
+        plt.figure(figsize=(10, 4))
+        series.hist(bins=50, alpha=0.7)
+        plt.title(f"{name} — {title}")
+        plt.xlabel(name)
+        plt.ylabel("Frequency")
+        plt.grid(True)
+        if output_folder:
+            png_path = os.path.join(output_folder, f"{name.lower()}_dist_{safe_title}.png")
+            plt.savefig(png_path, bbox_inches='tight')
+            plt.close()
+            print(f"→ saved plot: {png_path}")
+        else:
+            plt.show()
 
-    # Step 3: Clean up the legend
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), loc='upper left')
-
-    # Step 4: Finally show the plot
-    plt.show()
+    # --- Plot distributions ---
+    plot_dist(df['range'],        "Candle Range")
+    plot_dist(df['price_return'], "Candle Return")
+    plot_dist(df['ATR_14'],       "ATR_14")
+    plot_dist(df['efficiency'],   "Range Efficiency")

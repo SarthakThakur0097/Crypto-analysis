@@ -1,96 +1,68 @@
-# timeframe_processor.py
+# modules/session_statistics.py
+
 import pandas as pd
-from session_labeling import label_session
-from metrics_calculator import calculate_movement_metrics
+from typing import Tuple, Optional
 
-def process_timeframe(file_path, timeframe_name):
+from modules.session_labeler    import add_session_labels
+from modules.metrics_calculator import calculate_movement_metrics
+
+def process_timeframe(
+    file_path: str,
+    timeframe_name: str,
+    time_col: str = 'time'
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Load a timeframe dataset, label sessions, calculate metrics.
+    1) Loads a CSV of OHLCV bars (expects a 'time' column).
+    2) Parses & indexes on time_col.
+    3) Labels sessions (including overlaps) via add_session_labels.
+    4) Calculates movement & volatility metrics via calculate_movement_metrics.
+    5) Returns:
+         - df_enriched: full bar‐level DataFrame
+         - session_stats: summary stats per session
     """
+    # --- Load & index ---
+    df = pd.read_csv(
+        file_path,
+        parse_dates=[time_col],
+        infer_datetime_format=True
+    )
+    if time_col not in df.columns:
+        raise KeyError(f"Expected a '{time_col}' column in {file_path}")
+    df.set_index(time_col, inplace=True)
+    df.sort_index(inplace=True)
 
-    # Load
-    df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+    # --- Normalize column names to lowercase ---
+    df.rename(columns=str.lower, inplace=True)
 
-    # Rename columns properly
-    df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    # --- Session labeling & metrics enrichment ---
+    df = add_session_labels(df, timestamp_col=None)       # adds df['session']
+    df = calculate_movement_metrics(df)                   # adds range, price_return, ATR_14, efficiency
 
-    # Label sessions
-    df['session'] = df.index.map(label_session)
+    # --- Aggregate session‐level statistics ---
+    session_stats = calculate_session_statistics(df, timeframe_name)
 
-    # Calculate movement metrics
-    df = calculate_movement_metrics(df)
-
-    # Group and summarize by session
-    session_stats = df.groupby('session').agg({
-        'range': ['mean', 'max', 'std'],
-        'ATR_14': ['mean', 'max', 'std'],
-        'return': ['mean', 'std'],
-        'abs_return': ['mean', 'std'],
-        'efficiency': 'mean'
-    })
-
-    session_stats.columns = ['_'.join(col) for col in session_stats.columns]
-    session_stats['timeframe'] = timeframe_name
-
-    return session_stats
-
-def calculate_movement_metrics(df):
-    """Add range, return, ATR, efficiency columns to df."""
-    df['range'] = df['High'] - df['Low']
-    df['return'] = df['Close'].diff()
-    df['abs_return'] = df['return'].abs()
-    df['ATR_14'] = df['range'].rolling(window=14).mean()
-    df['efficiency'] = df['range'] / df['ATR_14']
-    return df
+    return df, session_stats
 
 
-def label_session(ts):
-    """Helper to label trading session (UTC time) including overlaps."""
-    if time(0, 0) <= ts.time() < time(7, 0):
-        return 'Asia'
-    elif time(7, 0) <= ts.time() < time(8, 0):
-        return 'Asia + London Overlap'
-    elif time(8, 0) <= ts.time() < time(13, 0):
-        return 'London'
-    elif time(13, 0) <= ts.time() < time(15, 0):
-        return 'London + NY Overlap'
-    elif time(15, 0) <= ts.time() < time(20, 0):
-        return 'New York'
-    else:
-        return 'Other'
-
-
-def calculate_session_statistics(df, timeframe_name='Unknown'):
+def calculate_session_statistics(
+    df: pd.DataFrame,
+    timeframe_name: str = 'Unknown'
+) -> pd.DataFrame:
     """
-    Given a dataframe with OHLCV, calculates session-wise stats.
+    Given a DataFrame with columns:
+      ['session','range','ATR_14','price_return','abs_return','efficiency'],
+    compute summary stats per session.
     """
-
-    # 1. Prepare Data
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
-
-    df['session'] = df.index.map(label_session)
-
-    # Calculate basic movement metrics
-    df['range'] = df['high'] - df['low']
-    df['return'] = df['close'].diff()
-    df['abs_return'] = df['return'].abs()
-    df['ATR_14'] = df['range'].rolling(window=14).mean()
-    df['efficiency'] = df['range'] / df['ATR_14']
-
-    # 2. Group by Session
-    session_stats = df.groupby('session').agg({
-        'range': ['mean', 'max', 'std'],
-        'ATR_14': ['mean', 'max', 'std'],
-        'return': ['mean', 'std'],
-        'abs_return': ['mean', 'std'],
-        'efficiency': 'mean'
-    })
-
-    # 3. Optional: rename columns for clarity
-    session_stats.columns = ['_'.join(col) for col in session_stats.columns]
-
-    # 4. Attach timeframe info
-    session_stats['timeframe'] = timeframe_name
-
-    return session_stats
+    agg = {
+        'range':        ['mean','max','std'],
+        'ATR_14':       ['mean','max','std'],
+        'price_return': ['mean','std'],
+        'abs_return':   ['mean','std'],
+        'efficiency':   'mean'
+    }
+    stats = df.groupby('session').agg(agg)
+    # flatten MultiIndex
+    stats.columns = ['_'.join(col) for col in stats.columns]
+    stats['timeframe'] = timeframe_name
+    stats = stats.reset_index()
+    return stats
